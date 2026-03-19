@@ -10,15 +10,12 @@ import gymnasium as gym
 from gymnasium import spaces
 
 def get_actual_processing_time(job_size, job_type, machine_idx):
-    
-
     is_gpu_node = machine_idx >= 7
     is_fast_cpu = machine_idx < 3
 
     base_speed = 0.6 if is_fast_cpu else 1.0
     machine_type = 1 if is_gpu_node else 0
     
-
     if job_type == machine_type:
         return (job_size * base_speed) * 0.5  
     else:
@@ -32,13 +29,10 @@ class RealWorldSchedulingEnv(gym.Env):
         self.lookahead = 10  
         
         self.action_space = spaces.Discrete(self.num_machines)
-        
-
         self.observation_space = spaces.Box(low=0, high=20, shape=(self.num_machines + (self.lookahead * 2),), dtype=np.float32)
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-
         self.jobs = [(np.random.randint(10, 101), random.choice([0, 1])) for _ in range(self.num_jobs)]
         self.current_job_idx = 0
         self.machine_times = [0.0] * self.num_machines
@@ -63,7 +57,6 @@ class RealWorldSchedulingEnv(gym.Env):
         old_makespan = max(self.machine_times)
         old_imbalance = np.std(self.machine_times) 
         
-
         actual_time = get_actual_processing_time(job_size, job_type, action)
         
         self.machine_times[action] += actual_time
@@ -72,24 +65,56 @@ class RealWorldSchedulingEnv(gym.Env):
         new_makespan = max(self.machine_times)
         new_imbalance = np.std(self.machine_times)
         
-       
+        # --- BASE REWARD ---
         reward = -(new_makespan - old_makespan) - (new_imbalance - old_imbalance)
         
+        # --- THE "TRAINING WHEELS" HARDWARE AFFINITY REWARD ---
+        is_gpu_node = action >= 7
+        machine_type = 1 if is_gpu_node else 0
+        
+        if job_type != machine_type:
+            reward -= 50.0  # Massive immediate penalty for mismatch
+        else:
+            reward += 5.0   # Small bonus for matching hardware correctly
+        # ------------------------------------------------------
+
         terminated = bool(self.current_job_idx >= self.num_jobs)
         return self._get_state(), reward, terminated, False, {}
 
-class DQN(nn.Module):
+# --- AGENTIC ARCHITECTURE (DUELING DQN) ---
+class AgenticScheduler(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, output_dim)
+        super(AgenticScheduler, self).__init__()
+        
+        # Shared memory/perception layer
+        self.feature_layer = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU()
+        )
+        
+        # 1. The Observer Agent (Evaluates overall system state)
+        self.observer = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1) 
+        )
+        
+        # 2. The Assigner Agent (Evaluates which machine gets the job)
+        self.assigner = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim) 
+        )
         
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
-
+        features = self.feature_layer(x)
+        system_value = self.observer(features)
+        machine_advantages = self.assigner(features)
+        
+        # Combine streams
+        q_values = system_value + (machine_advantages - machine_advantages.mean(dim=1, keepdim=True))
+        return q_values
+# ------------------------------------------
 
 def run_random_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
@@ -107,7 +132,6 @@ def run_fcfs_scheduler(jobs, num_machines):
 
 def run_sjf_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
-
     sorted_jobs = sorted(jobs, key=lambda x: x[0]) 
     for job_size, job_type in sorted_jobs:
         chosen_machine = machines.index(min(machines))
@@ -128,21 +152,25 @@ def run_ddqn_evaluation(env, policy_net, jobs):
         
     return max(env.machine_times)
 
-
-print("Training AI")
+print("Training AI...")
 env = RealWorldSchedulingEnv()
-policy_net = DQN(env.observation_space.shape[0], env.action_space.n)
-target_net = DQN(env.observation_space.shape[0], env.action_space.n)
+
+policy_net = AgenticScheduler(env.observation_space.shape[0], env.action_space.n)
+target_net = AgenticScheduler(env.observation_space.shape[0], env.action_space.n)
 target_net.load_state_dict(policy_net.state_dict())
 
 optimizer = optim.Adam(policy_net.parameters(), lr=1e-4) 
 memory = deque(maxlen=100000) 
-batch_size = 64
+
+# --- UPDATED HYPERPARAMETERS ---
+batch_size = 128          
+epsilon_decay = 0.9985    
+# -------------------------------
+
 gamma = 0.99
 tau = 0.005
 epsilon = 1.0
 min_epsilon = 0.05
-epsilon_decay = 0.997 
 episodes = 3500 
 episode_makespans = [] 
 
@@ -195,14 +223,12 @@ for episode in range(episodes):
         avg_makespan = np.mean(episode_makespans[-100:])
         print(f"Episode {episode + 1:4d}/{episodes} | Epsilon: {epsilon:.3f} | Avg Makespan: {avg_makespan:.1f}s")
 
-print("Training Complete!\n")
+print("\nTraining Complete!")
 
-
-torch.save(policy_net.state_dict(), "realworld_ddqn.pth")
-print("--> Model successfully saved to 'realworld_ddqn.pth'!\n")
-
-
-
+# --- SAFE FILE SAVING ---
+torch.save(policy_net.state_dict(), "agentic_ddqn.pth")
+print("--> Model successfully saved to 'agentic_ddqn.pth' (Your original file is safe)!\n")
+# ------------------------
 
 print("Running Real-World Algorithm Showdown...")
 
@@ -212,14 +238,14 @@ results = {
     "Random": 0, 
     "FCFS": 0,
     "SJF": 0,
-    "DDQN (Yours)": 0
+    "Agentic DDQN": 0
 }
 
 for i, jobs in enumerate(test_scenarios):
     results["Random"] += run_random_scheduler(jobs, env.num_machines)
     results["FCFS"] += run_fcfs_scheduler(jobs, env.num_machines)
     results["SJF"] += run_sjf_scheduler(jobs, env.num_machines)
-    results["DDQN (Yours)"] += run_ddqn_evaluation(env, policy_net, jobs)
+    results["Agentic DDQN"] += run_ddqn_evaluation(env, policy_net, jobs)
 
 for key in results:
     results[key] /= len(test_scenarios)
@@ -227,7 +253,6 @@ for key in results:
 print("\n--- Final Average Makespans (Lower is Better) ---")
 for key, value in results.items():
     print(f"{key}: {value:.1f}s")
-
 
 labels = list(results.keys())
 values = list(results.values())

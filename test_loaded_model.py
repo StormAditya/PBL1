@@ -7,10 +7,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import os
 
-# ==========================================
-# 1. The Environment & Network Definitions
-# (Must exactly match the training script!)
-# ==========================================
+
 def get_actual_processing_time(job_size, job_type, machine_idx):
     is_gpu_node = machine_idx >= 7
     is_fast_cpu = machine_idx < 3
@@ -19,9 +16,9 @@ def get_actual_processing_time(job_size, job_type, machine_idx):
     machine_type = 1 if is_gpu_node else 0
     
     if job_type == machine_type:
-        return (job_size * base_speed) * 0.5  # 2x FASTER
+        return (job_size * base_speed) * 0.5  
     else:
-        return (job_size * base_speed) * 3.0  # 3x SLOWER
+        return (job_size * base_speed) * 3.0 
 
 class RealWorldSchedulingEnv(gym.Env):
     def __init__(self):
@@ -59,7 +56,7 @@ class RealWorldSchedulingEnv(gym.Env):
         self.current_job_idx += 1
         
         terminated = bool(self.current_job_idx >= self.num_jobs)
-        # We don't need to calculate rewards during inference/testing!
+       
         return self._get_state(), 0.0, terminated, False, {}
 
 class DQN(nn.Module):
@@ -74,9 +71,7 @@ class DQN(nn.Module):
         x = torch.relu(self.fc2(x))
         return self.fc3(x)
 
-# ==========================================
-# 2. Traditional Baseline Algorithms
-# ==========================================
+
 def run_random_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
     for job_size, job_type in jobs:
@@ -108,15 +103,13 @@ def run_ddqn_evaluation(env, policy_net, jobs):
     while not terminated:
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
         with torch.no_grad():
-            # The AI instantly chooses the best action based on loaded weights
+           
             action = policy_net(state_tensor).argmax().item()
         state, _, terminated, _, _ = env.step(action)
         
     return max(env.machine_times)
 
-# ==========================================
-# 3. Load the Saved AI Model
-# ==========================================
+
 env = RealWorldSchedulingEnv()
 model_path = "realworld_ddqn.pth"
 
@@ -127,16 +120,12 @@ if not os.path.exists(model_path):
 print("Loading trained AI model...")
 loaded_policy_net = DQN(env.observation_space.shape[0], env.action_space.n)
 
-# Load the memory file (weights_only=True is a safe practice in modern PyTorch)
 loaded_policy_net.load_state_dict(torch.load(model_path, weights_only=True))
 
-# Lock the network into Evaluation Mode (disables any training behaviors)
 loaded_policy_net.eval() 
 print("Model loaded successfully!\n")
 
-# ==========================================
-# 4. Instant Showdown
-# ==========================================
+
 print("Running Real-World Algorithm Showdown on 10 New Scenarios...")
 test_scenarios = [[(np.random.randint(10, 101), random.choice([0, 1])) for _ in range(env.num_jobs)] for _ in range(10)]
 
@@ -151,7 +140,7 @@ for i, jobs in enumerate(test_scenarios):
     results["Random"] += run_random_scheduler(jobs, env.num_machines)
     results["FCFS"] += run_fcfs_scheduler(jobs, env.num_machines)
     results["SJF"] += run_sjf_scheduler(jobs, env.num_machines)
-    # Pass our loaded model into the evaluation function
+
     results["Loaded DDQN"] += run_ddqn_evaluation(env, loaded_policy_net, jobs)
 
 for key in results:
@@ -161,9 +150,7 @@ print("\n--- Final Average Makespans (Lower is Better) ---")
 for key, value in results.items():
     print(f"{key}: {value:.1f}s")
 
-# ==========================================
-# 5. Plot the Comparison
-# ==========================================
+
 labels = list(results.keys())
 values = list(results.values())
 
