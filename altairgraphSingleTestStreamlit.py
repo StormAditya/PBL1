@@ -56,6 +56,7 @@ class AgenticSchedulingEnv(gym.Env):
         self.job_pool = all_jobs[:self.pool_size]
         self.remaining_jobs = all_jobs[self.pool_size:]
         self.machine_times = [0.0] * self.num_machines
+        self.schedule_records = []
         return self._get_state(), {}
 
     def _get_state(self):
@@ -83,8 +84,18 @@ class AgenticSchedulingEnv(gym.Env):
         old_makespan = max(self.machine_times)
         old_imbalance = np.std(self.machine_times) 
 
+        start_time = self.machine_times[machine_idx]
         actual_time = get_actual_processing_time(job_size, job_type, machine_idx)
         self.machine_times[machine_idx] += actual_time
+        finish_time = self.machine_times[machine_idx]
+        is_gpu_node = machine_idx >= 7
+        affinity_match = int(job_type == (1 if is_gpu_node else 0))
+        self.schedule_records.append({
+            "start_time": start_time,
+            "finish_time": finish_time,
+            "processing_time": actual_time,
+            "affinity_match": affinity_match,
+        })
         
         if self.remaining_jobs:
             self.job_pool.append(self.remaining_jobs.pop(0))
@@ -110,27 +121,76 @@ class DQN(nn.Module):
 
 # --- 2. TRADITIONAL SCHEDULERS ---
 
+def compute_schedule_metrics(machine_times, schedule_records, num_machines):
+    makespan = max(machine_times) if machine_times else 0.0
+    total_work = sum(machine_times)
+    utilization = (total_work / (num_machines * makespan)) if makespan > 0 else 0.0
+    waiting_times = [record["start_time"] for record in schedule_records]
+    completion_times = [record["finish_time"] for record in schedule_records]
+    throughput = (len(schedule_records) / makespan) if makespan > 0 else 0.0
+    affinity_rate = (100.0 * np.mean([record["affinity_match"] for record in schedule_records])) if schedule_records else 0.0
+
+    return {
+        "makespan": makespan,
+        "avg_waiting_time": float(np.mean(waiting_times)) if waiting_times else 0.0,
+        "avg_completion_time": float(np.mean(completion_times)) if completion_times else 0.0,
+        "throughput": throughput,
+        "load_std": float(np.std(machine_times)) if machine_times else 0.0,
+        "utilization": utilization,
+        "affinity_rate": affinity_rate,
+    }
+
 def run_random_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
+    schedule_records = []
     for job_size, job_type in jobs:
         chosen_machine = random.randint(0, num_machines - 1)
-        machines[chosen_machine] += get_actual_processing_time(job_size, job_type, chosen_machine)
-    return max(machines)
+        start_time = machines[chosen_machine]
+        actual_time = get_actual_processing_time(job_size, job_type, chosen_machine)
+        machines[chosen_machine] += actual_time
+        is_gpu_node = chosen_machine >= 7
+        schedule_records.append({
+            "start_time": start_time,
+            "finish_time": machines[chosen_machine],
+            "processing_time": actual_time,
+            "affinity_match": int(job_type == (1 if is_gpu_node else 0)),
+        })
+    return compute_schedule_metrics(machines, schedule_records, num_machines)
 
 def run_fcfs_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
+    schedule_records = []
     for job_size, job_type in jobs:
         chosen_machine = machines.index(min(machines))
-        machines[chosen_machine] += get_actual_processing_time(job_size, job_type, chosen_machine)
-    return max(machines)
+        start_time = machines[chosen_machine]
+        actual_time = get_actual_processing_time(job_size, job_type, chosen_machine)
+        machines[chosen_machine] += actual_time
+        is_gpu_node = chosen_machine >= 7
+        schedule_records.append({
+            "start_time": start_time,
+            "finish_time": machines[chosen_machine],
+            "processing_time": actual_time,
+            "affinity_match": int(job_type == (1 if is_gpu_node else 0)),
+        })
+    return compute_schedule_metrics(machines, schedule_records, num_machines)
 
 def run_sjf_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
+    schedule_records = []
     sorted_jobs = sorted(jobs, key=lambda x: x[0]) 
     for job_size, job_type in sorted_jobs:
         chosen_machine = machines.index(min(machines))
-        machines[chosen_machine] += get_actual_processing_time(job_size, job_type, chosen_machine)
-    return max(machines)
+        start_time = machines[chosen_machine]
+        actual_time = get_actual_processing_time(job_size, job_type, chosen_machine)
+        machines[chosen_machine] += actual_time
+        is_gpu_node = chosen_machine >= 7
+        schedule_records.append({
+            "start_time": start_time,
+            "finish_time": machines[chosen_machine],
+            "processing_time": actual_time,
+            "affinity_match": int(job_type == (1 if is_gpu_node else 0)),
+        })
+    return compute_schedule_metrics(machines, schedule_records, num_machines)
 
 # --- 3. AGENTIC AI EVALUATION ---
 
@@ -147,6 +207,7 @@ def run_agentic_evaluation(env, policy_net, jobs):
     env.job_pool = jobs[:env.pool_size].copy()
     env.remaining_jobs = jobs[env.pool_size:].copy()
     env.machine_times = [0.0] * env.num_machines
+    env.schedule_records = []
     
     state = env._get_state()
     terminated = False
@@ -161,7 +222,7 @@ def run_agentic_evaluation(env, policy_net, jobs):
             
         state, _, terminated, _, _ = env.step(action)
         
-    return max(env.machine_times)
+    return compute_schedule_metrics(env.machine_times, env.schedule_records, env.num_machines)
 
 # --- 4. STREAMLIT UI & EXECUTION ---
 
@@ -202,8 +263,31 @@ if st.session_state.run_sim:
             for _ in range(num_test_scenarios)
         ]
 
+        metrics_to_report = [
+            "makespan",
+            "avg_waiting_time",
+            "avg_completion_time",
+            "throughput",
+            "utilization",
+            "affinity_rate",
+        ]
+
+        metric_display = {
+            "makespan": "Makespan (s)",
+            "avg_waiting_time": "Avg Waiting Time (s)",
+            "avg_completion_time": "Avg Completion Time (s)",
+            "throughput": "Throughput (jobs/s)",
+            "utilization": "Utilization (%)",
+            "affinity_rate": "Affinity Match Rate (%)",
+        }
+
         raw_data = []
-        results = {"Random": 0, "FCFS": 0, "SJF": 0, "Agentic AI": 0}
+        results = {
+            "Random": {metric: 0.0 for metric in metrics_to_report},
+            "FCFS": {metric: 0.0 for metric in metrics_to_report},
+            "SJF": {metric: 0.0 for metric in metrics_to_report},
+            "Agentic AI": {metric: 0.0 for metric in metrics_to_report},
+        }
 
         for i, jobs in enumerate(test_scenarios):
             r_rand = run_random_scheduler(jobs, env.num_machines)
@@ -211,19 +295,52 @@ if st.session_state.run_sim:
             r_sjf = run_sjf_scheduler(jobs, env.num_machines)
             r_ai = run_agentic_evaluation(env, policy_net, jobs)
             
-            results["Random"] += r_rand
-            results["FCFS"] += r_fcfs
-            results["SJF"] += r_sjf
-            results["Agentic AI"] += r_ai
-            
-            raw_data.append({"Scenario": i + 1, "Random": r_rand, "FCFS": r_fcfs, "SJF": r_sjf, "AI": r_ai})
+            for metric in metrics_to_report:
+                results["Random"][metric] += r_rand[metric]
+                results["FCFS"][metric] += r_fcfs[metric]
+                results["SJF"][metric] += r_sjf[metric]
+                results["Agentic AI"][metric] += r_ai[metric]
+
+            for algorithm, metric_values in {
+                "Random": r_rand,
+                "FCFS": r_fcfs,
+                "SJF": r_sjf,
+                "Agentic AI": r_ai,
+            }.items():
+                raw_row = {
+                    "Scenario": i + 1,
+                    "Algorithm": algorithm,
+                    "Makespan (s)": metric_values["makespan"],
+                    "Avg Waiting Time (s)": metric_values["avg_waiting_time"],
+                    "Avg Completion Time (s)": metric_values["avg_completion_time"],
+                    "Throughput (jobs/s)": metric_values["throughput"],
+                    "Utilization (%)": metric_values["utilization"] * 100.0,
+                    "Affinity Match Rate (%)": metric_values["affinity_rate"],
+                }
+                raw_data.append(raw_row)
 
         for key in results:
-            results[key] /= num_test_scenarios
+            for metric in metrics_to_report:
+                results[key][metric] /= num_test_scenarios
+
+        average_rows = []
+        for algorithm, metric_values in results.items():
+            average_rows.append({
+                "Algorithm": algorithm,
+                metric_display["makespan"]: metric_values["makespan"],
+                metric_display["avg_waiting_time"]: metric_values["avg_waiting_time"],
+                metric_display["avg_completion_time"]: metric_values["avg_completion_time"],
+                metric_display["throughput"]: metric_values["throughput"],
+                metric_display["utilization"]: metric_values["utilization"] * 100.0,
+                metric_display["affinity_rate"]: metric_values["affinity_rate"],
+            })
             
         # Save results to session memory
         st.session_state.results = results
         st.session_state.raw_data = raw_data
+        st.session_state.average_metrics = average_rows
+        st.session_state.metric_display = metric_display
+        st.session_state.metrics_to_report = metrics_to_report
         
         # Turn off the run flag so changing sliders won't re-trigger this block
         st.session_state.run_sim = False
@@ -234,34 +351,55 @@ if st.session_state.run_sim:
 if st.session_state.results is not None:
     results = st.session_state.results
     raw_data = st.session_state.raw_data
+    average_metrics = st.session_state.average_metrics
+    metric_display = st.session_state.metric_display
+    metrics_to_report = st.session_state.metrics_to_report
 
-    tab1, tab2 = st.tabs(["Dashboard View", "Raw Data View"])
+    tab1, tab2, tab3 = st.tabs(["Dashboard View", "Raw Data View", "Average Metrics Table"])
 
     with tab1:
         left_col, right_col = st.columns([1, 2.5])
         
         with left_col:
-            improvement = ((results['FCFS'] - results['Agentic AI']) / results['FCFS']) * 100 if results['FCFS'] > 0 else 0
+            fcfs_makespan = results["FCFS"]["makespan"]
+            ai_makespan = results["Agentic AI"]["makespan"]
+            improvement = ((fcfs_makespan - ai_makespan) / fcfs_makespan) * 100 if fcfs_makespan > 0 else 0
             
             if improvement > 0:
                 st.success(f"**AI won!** {improvement:.1f}% faster than FCFS.")
             else:
                 st.warning(f"**AI lost.** {abs(improvement):.1f}% slower than FCFS.")
-                
-            st.markdown("### Average Makespans")
-            m1, m2 = st.columns(2)
-            m1.metric("Random", f"{results['Random']:.1f}s")
-            m2.metric("FCFS", f"{results['FCFS']:.1f}s")
-            m1.metric("SJF", f"{results['SJF']:.1f}s")
-            m2.metric("Agentic AI", f"{results['Agentic AI']:.1f}s")
+
+            selected_metric = st.selectbox(
+                "Metric for Comparison Chart",
+                options=metrics_to_report,
+                format_func=lambda x: metric_display[x],
+                index=0,
+            )
+
+            st.info(
+                """
+                **Environment Guide**
+                - **Machine Types:**
+                  - Machines `0-2`: Fast CPU nodes
+                  - Machines `3-6`: Standard CPU nodes
+                  - Machines `7-9`: GPU nodes
+                - **Job Types:**
+                  - `0` = CPU oriented job
+                  - `1` = GPU oriented job
+                - **Affinity Rule:**
+                  - Matching job type to machine type runs much faster
+                  - Mismatch runs much slower
+                """
+            )
 
         with right_col:
-            st.markdown("### Makespan Comparison")
+            st.markdown(f"### {metric_display[selected_metric]} Comparison")
             
             # Structure the data
             chart_df = pd.DataFrame({
                 "Algorithm": list(results.keys()),
-                "Makespan (Seconds)": list(results.values())
+                "Metric Value": [results[algorithm][selected_metric] for algorithm in results.keys()]
             })
             
             # Define the exact order and colors
@@ -270,13 +408,13 @@ if st.session_state.results is not None:
             # Create the Base Bar Chart
             bars = alt.Chart(chart_df).mark_bar().encode(
                 x=alt.X('Algorithm', sort=sort_order, axis=alt.Axis(labelAngle=0, title="Scheduling Algorithm")),
-                y=alt.Y('Makespan (Seconds)', title="Average Makespan (Lower is Better)"),
+                y=alt.Y('Metric Value', title=metric_display[selected_metric]),
                 color=alt.Color(
                     'Algorithm', 
                     legend=None, 
                     scale=alt.Scale(domain=sort_order, range=['#e74c3c', '#3498db', '#9b59b6', '#2ecc71'])
                 ),
-                tooltip=['Algorithm', 'Makespan (Seconds)']
+                tooltip=['Algorithm', 'Metric Value']
             )
 
             # Create the Text Labels Layer
@@ -287,7 +425,7 @@ if st.session_state.results is not None:
                 fontWeight='bold',
                 fontSize=14
             ).encode(
-                text=alt.Text('Makespan (Seconds):Q', format='.1f') 
+                text=alt.Text('Metric Value:Q', format='.2f') 
             )
 
             # Combine bars and text, and set height
@@ -297,6 +435,11 @@ if st.session_state.results is not None:
             st.altair_chart(chart, use_container_width=True)
 
     with tab2:
-        st.markdown("Raw makespan data across all individual runs.")
-        df = pd.DataFrame(raw_data).set_index("Scenario")
+        st.markdown("Raw per-scenario metrics for every algorithm.")
+        df = pd.DataFrame(raw_data)
         st.dataframe(df, use_container_width=True, height=400)
+
+    with tab3:
+        st.markdown("Average metrics across all test scenarios.")
+        avg_df = pd.DataFrame(average_metrics).set_index("Algorithm")
+        st.dataframe(avg_df.style.format("{:.2f}"), use_container_width=True, height=420)

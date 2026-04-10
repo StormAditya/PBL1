@@ -45,6 +45,7 @@ class AgenticSchedulingEnv(gym.Env):
         self.job_pool = all_jobs[:self.pool_size]
         self.remaining_jobs = all_jobs[self.pool_size:]
         self.machine_times = [0.0] * self.num_machines
+        self.schedule_records = []
         return self._get_state(), {}
 
     def _get_state(self):
@@ -73,8 +74,18 @@ class AgenticSchedulingEnv(gym.Env):
         old_makespan = max(self.machine_times)
         old_imbalance = np.std(self.machine_times) 
 
+        start_time = self.machine_times[machine_idx]
         actual_time = get_actual_processing_time(job_size, job_type, machine_idx)
         self.machine_times[machine_idx] += actual_time
+        finish_time = self.machine_times[machine_idx]
+        is_gpu_node = machine_idx >= 7
+        affinity_match = int(job_type == (1 if is_gpu_node else 0))
+        self.schedule_records.append({
+            "start_time": start_time,
+            "finish_time": finish_time,
+            "processing_time": actual_time,
+            "affinity_match": affinity_match,
+        })
         
         if self.remaining_jobs:
             self.job_pool.append(self.remaining_jobs.pop(0))
@@ -100,27 +111,76 @@ class DQN(nn.Module):
 
 # --- TRADITIONAL SCHEDULERS ---
 
+def compute_schedule_metrics(machine_times, schedule_records, num_machines):
+    makespan = max(machine_times) if machine_times else 0.0
+    total_work = sum(machine_times)
+    utilization = (total_work / (num_machines * makespan)) if makespan > 0 else 0.0
+    waiting_times = [record["start_time"] for record in schedule_records]
+    completion_times = [record["finish_time"] for record in schedule_records]
+    throughput = (len(schedule_records) / makespan) if makespan > 0 else 0.0
+    affinity_rate = (100.0 * np.mean([record["affinity_match"] for record in schedule_records])) if schedule_records else 0.0
+
+    return {
+        "makespan": makespan,
+        "avg_waiting_time": float(np.mean(waiting_times)) if waiting_times else 0.0,
+        "avg_completion_time": float(np.mean(completion_times)) if completion_times else 0.0,
+        "throughput": throughput,
+        "load_std": float(np.std(machine_times)) if machine_times else 0.0,
+        "utilization": utilization,
+        "affinity_rate": affinity_rate,
+    }
+
 def run_random_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
+    schedule_records = []
     for job_size, job_type in jobs:
         chosen_machine = random.randint(0, num_machines - 1)
-        machines[chosen_machine] += get_actual_processing_time(job_size, job_type, chosen_machine)
-    return max(machines)
+        start_time = machines[chosen_machine]
+        actual_time = get_actual_processing_time(job_size, job_type, chosen_machine)
+        machines[chosen_machine] += actual_time
+        is_gpu_node = chosen_machine >= 7
+        schedule_records.append({
+            "start_time": start_time,
+            "finish_time": machines[chosen_machine],
+            "processing_time": actual_time,
+            "affinity_match": int(job_type == (1 if is_gpu_node else 0)),
+        })
+    return compute_schedule_metrics(machines, schedule_records, num_machines)
 
 def run_fcfs_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
+    schedule_records = []
     for job_size, job_type in jobs:
         chosen_machine = machines.index(min(machines))
-        machines[chosen_machine] += get_actual_processing_time(job_size, job_type, chosen_machine)
-    return max(machines)
+        start_time = machines[chosen_machine]
+        actual_time = get_actual_processing_time(job_size, job_type, chosen_machine)
+        machines[chosen_machine] += actual_time
+        is_gpu_node = chosen_machine >= 7
+        schedule_records.append({
+            "start_time": start_time,
+            "finish_time": machines[chosen_machine],
+            "processing_time": actual_time,
+            "affinity_match": int(job_type == (1 if is_gpu_node else 0)),
+        })
+    return compute_schedule_metrics(machines, schedule_records, num_machines)
 
 def run_sjf_scheduler(jobs, num_machines):
     machines = [0.0] * num_machines
+    schedule_records = []
     sorted_jobs = sorted(jobs, key=lambda x: x[0]) 
     for job_size, job_type in sorted_jobs:
         chosen_machine = machines.index(min(machines))
-        machines[chosen_machine] += get_actual_processing_time(job_size, job_type, chosen_machine)
-    return max(machines)
+        start_time = machines[chosen_machine]
+        actual_time = get_actual_processing_time(job_size, job_type, chosen_machine)
+        machines[chosen_machine] += actual_time
+        is_gpu_node = chosen_machine >= 7
+        schedule_records.append({
+            "start_time": start_time,
+            "finish_time": machines[chosen_machine],
+            "processing_time": actual_time,
+            "affinity_match": int(job_type == (1 if is_gpu_node else 0)),
+        })
+    return compute_schedule_metrics(machines, schedule_records, num_machines)
 
 def get_valid_actions(env):
     """Returns a boolean mask of valid actions (False for picking empty pool slots)"""
@@ -137,6 +197,7 @@ def run_agentic_evaluation(env, policy_net, jobs):
     env.job_pool = jobs[:env.pool_size].copy()
     env.remaining_jobs = jobs[env.pool_size:].copy()
     env.machine_times = [0.0] * env.num_machines
+    env.schedule_records = []
     
     state = env._get_state()
     terminated = False
@@ -154,7 +215,7 @@ def run_agentic_evaluation(env, policy_net, jobs):
             
         state, _, terminated, _, _ = env.step(action)
         
-    return max(env.machine_times)
+    return compute_schedule_metrics(env.machine_times, env.schedule_records, env.num_machines)
 
 # --- TRAINING ---
 print("Training Agentic AI (Active Picker)")
@@ -242,29 +303,53 @@ print("Running Real-World Algorithm Showdown...")
 # Generate 10 identical test scenarios for all algorithms
 test_scenarios = [[(np.random.randint(10, 101), random.choice([0, 1])) for _ in range(env.num_jobs)] for _ in range(10)]
 
+metrics_to_report = [
+    "makespan",
+    "avg_waiting_time",
+    "avg_completion_time",
+    "throughput",
+    "load_std",
+    "utilization",
+    "affinity_rate",
+]
+
 results = {
-    "Random": 0, 
-    "FCFS": 0,
-    "SJF": 0,
-    "Agentic AI (Yours)": 0
+    "Random": {metric: 0.0 for metric in metrics_to_report},
+    "FCFS": {metric: 0.0 for metric in metrics_to_report},
+    "SJF": {metric: 0.0 for metric in metrics_to_report},
+    "Agentic AI (Yours)": {metric: 0.0 for metric in metrics_to_report},
 }
 
 for i, jobs in enumerate(test_scenarios):
-    results["Random"] += run_random_scheduler(jobs, env.num_machines)
-    results["FCFS"] += run_fcfs_scheduler(jobs, env.num_machines)
-    results["SJF"] += run_sjf_scheduler(jobs, env.num_machines)
-    results["Agentic AI (Yours)"] += run_agentic_evaluation(env, policy_net, jobs)
+    random_metrics = run_random_scheduler(jobs, env.num_machines)
+    fcfs_metrics = run_fcfs_scheduler(jobs, env.num_machines)
+    sjf_metrics = run_sjf_scheduler(jobs, env.num_machines)
+    agentic_metrics = run_agentic_evaluation(env, policy_net, jobs)
+
+    for metric in metrics_to_report:
+        results["Random"][metric] += random_metrics[metric]
+        results["FCFS"][metric] += fcfs_metrics[metric]
+        results["SJF"][metric] += sjf_metrics[metric]
+        results["Agentic AI (Yours)"][metric] += agentic_metrics[metric]
 
 for key in results:
-    results[key] /= len(test_scenarios)
+    for metric in metrics_to_report:
+        results[key][metric] /= len(test_scenarios)
 
-print("\n--- Final Average Makespans (Lower is Better) ---")
-for key, value in results.items():
-    print(f"{key}: {value:.1f}s")
+print("\n--- Final Average Metrics Across Scenarios ---")
+for key, metric_values in results.items():
+    print(f"\n{key}")
+    print(f"  Makespan (Lower Better): {metric_values['makespan']:.1f}s")
+    print(f"  Avg Waiting Time (Lower Better): {metric_values['avg_waiting_time']:.1f}s")
+    print(f"  Avg Completion Time (Lower Better): {metric_values['avg_completion_time']:.1f}s")
+    print(f"  Throughput (Higher Better): {metric_values['throughput']:.3f} jobs/s")
+    print(f"  Load Std Dev (Lower Better): {metric_values['load_std']:.2f}")
+    print(f"  Utilization (Higher Better): {metric_values['utilization'] * 100:.1f}%")
+    print(f"  Affinity Match Rate (Higher Better): {metric_values['affinity_rate']:.1f}%")
 
 # --- VISUALIZATION ---
 labels = list(results.keys())
-values = list(results.values())
+values = [results[label]["makespan"] for label in labels]
 
 plt.figure(figsize=(10, 6))
 colors = ['red', 'gray', 'purple', 'green']
