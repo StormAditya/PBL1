@@ -26,12 +26,9 @@ class AgenticSchedulingEnv(gym.Env):
         super().__init__()
         self.num_jobs = 100        
         self.num_machines = 10 
-        self.pool_size = 5 # The agent can see and pick from 5 jobs at once
+        self.pool_size = 5 
         
-        # Action space: Pool Size (Which job to pick) * Num Machines (Where to put it)
         self.action_space = spaces.Discrete(self.pool_size * self.num_machines)
-        
-        # State: (5 jobs * 2 features) + 10 machine times
         self.observation_space = spaces.Box(
             low=0, high=20, 
             shape=((self.pool_size * 2) + self.num_machines,), 
@@ -40,7 +37,8 @@ class AgenticSchedulingEnv(gym.Env):
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        all_jobs = [(np.random.randint(10, 101), random.choice([0, 1])) for _ in range(self.num_jobs)]
+        # CHANGED: Jobs are now larger (50 to 200) to naturally push makespan > 500
+        all_jobs = [(np.random.randint(50, 201), random.choice([0, 1])) for _ in range(self.num_jobs)]
         
         self.job_pool = all_jobs[:self.pool_size]
         self.remaining_jobs = all_jobs[self.pool_size:]
@@ -51,12 +49,14 @@ class AgenticSchedulingEnv(gym.Env):
         state_features = []
         for i in range(self.pool_size):
             if i < len(self.job_pool):
-                state_features.append(self.job_pool[i][0] / 100.0)
+                # CHANGED: Normalized by 200.0 instead of 100.0 to match new job sizes
+                state_features.append(self.job_pool[i][0] / 200.0)
                 state_features.append(float(self.job_pool[i][1]))
             else:
                 state_features.extend([0.0, 0.0])
                 
-        norm_machines = [m / 1000.0 for m in self.machine_times] 
+        # CHANGED: Normalized by 3000.0 because total machine times will be much higher now
+        norm_machines = [m / 3000.0 for m in self.machine_times] 
         state_features.extend(norm_machines)
         return np.array(state_features, dtype=np.float32)
 
@@ -64,7 +64,6 @@ class AgenticSchedulingEnv(gym.Env):
         job_idx_in_pool = action // self.num_machines
         machine_idx = action % self.num_machines
         
-        # Failsafe penalty if it picks an empty slot
         if job_idx_in_pool >= len(self.job_pool):
             return self._get_state(), -10.0, False, False, {}
             
@@ -123,7 +122,6 @@ def run_sjf_scheduler(jobs, num_machines):
     return max(machines)
 
 def get_valid_actions(env):
-    """Returns a boolean mask of valid actions (False for picking empty pool slots)"""
     mask = torch.ones(env.action_space.n, dtype=torch.bool)
     for i in range(env.action_space.n):
         job_idx = i // env.num_machines
@@ -133,7 +131,6 @@ def get_valid_actions(env):
 
 def run_agentic_evaluation(env, policy_net, jobs):
     env.reset()
-    # Load the exact test jobs into the agent's environment
     env.job_pool = jobs[:env.pool_size].copy()
     env.remaining_jobs = jobs[env.pool_size:].copy()
     env.machine_times = [0.0] * env.num_machines
@@ -146,7 +143,6 @@ def run_agentic_evaluation(env, policy_net, jobs):
         with torch.no_grad():
             q_values = policy_net(state_tensor)
             
-            # Action Masking: Force Q-values of illegal moves to negative infinity
             valid_mask = get_valid_actions(env)
             q_values[0, ~valid_mask] = -float('inf')
             
@@ -157,7 +153,7 @@ def run_agentic_evaluation(env, policy_net, jobs):
     return max(env.machine_times)
 
 # --- TRAINING ---
-print("Training Agentic AI (Active Picker)")
+print("Training Standard DQN Agent...")
 env = AgenticSchedulingEnv()
 policy_net = DQN(env.observation_space.shape[0], env.action_space.n)
 target_net = DQN(env.observation_space.shape[0], env.action_space.n)
@@ -171,9 +167,10 @@ tau = 0.005
 epsilon = 1.0
 min_epsilon = 0.05
 epsilon_decay = 0.997 
-episodes = 3500 
-episode_makespans = [] 
 
+# 2000 Episodes as requested
+episodes = 2000 
+episode_makespans = [] 
 
 for episode in range(episodes):
     state, _ = env.reset()
@@ -183,14 +180,13 @@ for episode in range(episodes):
         valid_mask = get_valid_actions(env)
         
         if random.random() < epsilon:
-            # Sample only from valid actions
             valid_actions = torch.where(valid_mask)[0].tolist()
             action = random.choice(valid_actions)
         else:
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
             with torch.no_grad():
                 q_values = policy_net(state_tensor)
-                q_values[0, ~valid_mask] = -float('inf') # Mask invalid actions
+                q_values[0, ~valid_mask] = -float('inf') 
                 action = q_values.argmax().item()
                 
         next_state, reward, terminated, _, _ = env.step(action)
@@ -207,9 +203,9 @@ for episode in range(episodes):
             
             current_q = policy_net(states).gather(1, actions)
             
+            # Standard DQN Target Calculation
             with torch.no_grad():
-                best_next_actions = policy_net(next_states).argmax(dim=1, keepdim=True)
-                max_next_q = target_net(next_states).gather(1, best_next_actions)
+                max_next_q = target_net(next_states).max(1)[0].unsqueeze(1)
                 target_q = rewards + (1 - dones) * gamma * max_next_q
                 
             loss = F.smooth_l1_loss(current_q, target_q)
@@ -232,28 +228,28 @@ for episode in range(episodes):
 
 print("Training Complete!\n")
 
-torch.save(policy_net.state_dict(), "single_agentic_ddqn.pth")
-print("--> Model successfully saved to 'single_agentic_ddqn.pth'!\n")
+torch.save(policy_net.state_dict(), "single_agentic_standard_dqn.pth")
+print("--> Model successfully saved to 'single_agentic_standard_dqn.pth'!\n")
 
 
 # --- ALGORITHM SHOWDOWN ---
 print("Running Real-World Algorithm Showdown...")
 
-# Generate 10 identical test scenarios for all algorithms
-test_scenarios = [[(np.random.randint(10, 101), random.choice([0, 1])) for _ in range(env.num_jobs)] for _ in range(10)]
+# CHANGED: Ensure the test scenarios also generate the larger 50-200 jobs
+test_scenarios = [[(np.random.randint(50, 201), random.choice([0, 1])) for _ in range(env.num_jobs)] for _ in range(10)]
 
 results = {
     "Random": 0, 
     "FCFS": 0,
     "SJF": 0,
-    "Agentic AI (Yours)": 0
+    "Standard DQN": 0
 }
 
 for i, jobs in enumerate(test_scenarios):
     results["Random"] += run_random_scheduler(jobs, env.num_machines)
     results["FCFS"] += run_fcfs_scheduler(jobs, env.num_machines)
     results["SJF"] += run_sjf_scheduler(jobs, env.num_machines)
-    results["Agentic AI (Yours)"] += run_agentic_evaluation(env, policy_net, jobs)
+    results["Standard DQN"] += run_agentic_evaluation(env, policy_net, jobs)
 
 for key in results:
     results[key] /= len(test_scenarios)
@@ -263,20 +259,35 @@ for key, value in results.items():
     print(f"{key}: {value:.1f}s")
 
 # --- VISUALIZATION ---
+plt.figure(figsize=(15, 6))
+
+# --- Plot 1: Algorithm Showdown (Bar Chart) ---
+plt.subplot(1, 2, 1)
 labels = list(results.keys())
 values = list(results.values())
-
-plt.figure(figsize=(10, 6))
 colors = ['red', 'gray', 'purple', 'green']
 bars = plt.bar(labels, values, color=colors)
 
-plt.title("Real-World Factory (Hardware Affinities) - Showdown")
-plt.ylabel("Makespan (Seconds) - Lower is Better")
+plt.title("Real-World Factory Showdown\n(Lower is Better)", fontweight='bold')
+plt.ylabel("Makespan (Seconds)")
 
 for bar in bars:
     yval = bar.get_height()
     plt.text(bar.get_x() + bar.get_width()/2, yval + (max(values)*0.01), f"{yval:.1f}s", ha='center', va='bottom', fontweight='bold')
 
+# Graph limits auto-scale from 0 to slightly above the tallest bar
 plt.ylim(bottom=0, top=max(values) * 1.1) 
+
+# --- Plot 2: Learning Curve (Raw Data Only) ---
+plt.subplot(1, 2, 2)
+
+plt.plot(episode_makespans, label='Raw Episode Makespan', color='blue', linewidth=1.5)
+
+plt.title("Standard DQN Learning Curve Over Time\n(Raw Data Only)", fontweight='bold')
+plt.xlabel("Training Episode")
+plt.ylabel("Makespan (Seconds)")
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.6)
+
 plt.tight_layout() 
 plt.show()

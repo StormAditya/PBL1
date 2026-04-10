@@ -183,7 +183,7 @@ st.sidebar.button("🚀 Run Simulation", type="primary", use_container_width=Tru
 
 
 # --- EXECUTION LOGIC ---
-# Only run the heavy math if the flag is True
+# Only run if the flag is True
 if st.session_state.run_sim:
     with st.spinner("Loading environment and running simulations..."):
         env = AgenticSchedulingEnv()
@@ -229,7 +229,7 @@ if st.session_state.run_sim:
         st.session_state.run_sim = False
 
 
-# --- UI DISPLAY RESULTS (COMPACT LAYOUT) ---
+# --- UI DISPLAY RESULTS  ---
 # We only display if we have data in memory
 if st.session_state.results is not None:
     results = st.session_state.results
